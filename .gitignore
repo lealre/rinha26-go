@@ -32,3 +32,8 @@ go.work.sum
 # .vscode/
 
 resources
+
+# Build artifacts
+/index.bin
+/build-index
+/api
