@@ -15,7 +15,7 @@ const (
 	IVFSQ_K      = 1024 // number of IVF clusters
 	IVFSQ_Dim    = 14   // vector dimensionality
 	IVFSQ_TopK   = 5    // number of nearest neighbors to retrieve
-	IVFSQ_NProbe = 16   // clusters probed per query (doubled vs ivf-pq's 8)
+	IVFSQ_NProbe = 8    // clusters probed per query (was 16; halved to cut p99 since detection rate component is already saturated at nprobe=16)
 	IVFSQ_Scale  = 32767
 )
 
@@ -246,45 +246,90 @@ func (ivf *IVFSQ) Search(query [IVFSQ_Dim]float32) int {
 		top[i].dist = math.MaxInt64
 	}
 
+	// threshold caches the current 5th-best distance so the hot inner loop
+	// can bail out as soon as a partial squared sum exceeds it. Most
+	// candidates fall far from the query; per-dim early exit lets us skip
+	// the remaining dims (and the int64 multiplies) for those candidates.
+	threshold := top[IVFSQ_TopK-1].dist
+
 	for _, probe := range topProbes {
 		c := probe.idx
 		start := ivf.ClusterOffsets[c]
 		end := ivf.ClusterOffsets[c+1]
 		for i := start; i < end; i++ {
 			base := int(i) * IVFSQ_Dim
-			d0 := qInt[0] - int32(ivf.Quantized[base+0])
-			d1 := qInt[1] - int32(ivf.Quantized[base+1])
-			d2 := qInt[2] - int32(ivf.Quantized[base+2])
-			d3 := qInt[3] - int32(ivf.Quantized[base+3])
-			d4 := qInt[4] - int32(ivf.Quantized[base+4])
-			d5 := qInt[5] - int32(ivf.Quantized[base+5])
-			d6 := qInt[6] - int32(ivf.Quantized[base+6])
-			d7 := qInt[7] - int32(ivf.Quantized[base+7])
-			d8 := qInt[8] - int32(ivf.Quantized[base+8])
-			d9 := qInt[9] - int32(ivf.Quantized[base+9])
-			d10 := qInt[10] - int32(ivf.Quantized[base+10])
-			d11 := qInt[11] - int32(ivf.Quantized[base+11])
-			d12 := qInt[12] - int32(ivf.Quantized[base+12])
-			d13 := qInt[13] - int32(ivf.Quantized[base+13])
 
-			sum := int64(d0)*int64(d0) +
-				int64(d1)*int64(d1) +
-				int64(d2)*int64(d2) +
-				int64(d3)*int64(d3) +
-				int64(d4)*int64(d4) +
-				int64(d5)*int64(d5) +
-				int64(d6)*int64(d6) +
-				int64(d7)*int64(d7) +
-				int64(d8)*int64(d8) +
-				int64(d9)*int64(d9) +
-				int64(d10)*int64(d10) +
-				int64(d11)*int64(d11) +
-				int64(d12)*int64(d12) +
-				int64(d13)*int64(d13)
-
-			if sum >= top[IVFSQ_TopK-1].dist {
+			d := qInt[0] - int32(ivf.Quantized[base+0])
+			sum := int64(d) * int64(d)
+			if sum >= threshold {
 				continue
 			}
+			d = qInt[1] - int32(ivf.Quantized[base+1])
+			sum += int64(d) * int64(d)
+			if sum >= threshold {
+				continue
+			}
+			d = qInt[2] - int32(ivf.Quantized[base+2])
+			sum += int64(d) * int64(d)
+			if sum >= threshold {
+				continue
+			}
+			d = qInt[3] - int32(ivf.Quantized[base+3])
+			sum += int64(d) * int64(d)
+			if sum >= threshold {
+				continue
+			}
+			d = qInt[4] - int32(ivf.Quantized[base+4])
+			sum += int64(d) * int64(d)
+			if sum >= threshold {
+				continue
+			}
+			d = qInt[5] - int32(ivf.Quantized[base+5])
+			sum += int64(d) * int64(d)
+			if sum >= threshold {
+				continue
+			}
+			d = qInt[6] - int32(ivf.Quantized[base+6])
+			sum += int64(d) * int64(d)
+			if sum >= threshold {
+				continue
+			}
+			d = qInt[7] - int32(ivf.Quantized[base+7])
+			sum += int64(d) * int64(d)
+			if sum >= threshold {
+				continue
+			}
+			d = qInt[8] - int32(ivf.Quantized[base+8])
+			sum += int64(d) * int64(d)
+			if sum >= threshold {
+				continue
+			}
+			d = qInt[9] - int32(ivf.Quantized[base+9])
+			sum += int64(d) * int64(d)
+			if sum >= threshold {
+				continue
+			}
+			d = qInt[10] - int32(ivf.Quantized[base+10])
+			sum += int64(d) * int64(d)
+			if sum >= threshold {
+				continue
+			}
+			d = qInt[11] - int32(ivf.Quantized[base+11])
+			sum += int64(d) * int64(d)
+			if sum >= threshold {
+				continue
+			}
+			d = qInt[12] - int32(ivf.Quantized[base+12])
+			sum += int64(d) * int64(d)
+			if sum >= threshold {
+				continue
+			}
+			d = qInt[13] - int32(ivf.Quantized[base+13])
+			sum += int64(d) * int64(d)
+			if sum >= threshold {
+				continue
+			}
+
 			fraud := ivf.Labels[i] == 1
 			k := IVFSQ_TopK - 1
 			for k > 0 && top[k-1].dist > sum {
@@ -292,6 +337,7 @@ func (ivf *IVFSQ) Search(query [IVFSQ_Dim]float32) int {
 				k--
 			}
 			top[k] = cand{dist: sum, fraud: fraud}
+			threshold = top[IVFSQ_TopK-1].dist
 		}
 	}
 
