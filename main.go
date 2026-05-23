@@ -4,18 +4,21 @@ import (
 	"flag"
 	"log"
 	"net/http"
+	_ "net/http/pprof"
 	"path/filepath"
 	"sync/atomic"
 	"time"
+
+	"github.com/lealre/rinha26-go/internal/ivfpq"
 )
 
 func main() {
-	resourcesDir := flag.String("resources-dir", "./resources", "directory containing references.json.gz, mcc_risk.json, normalization.json")
+	resourcesDir := flag.String("resources-dir", "./resources", "directory containing normalization.json and mcc_risk.json")
+	indexPath := flag.String("index", "./index.bin", "path to the prebuilt IVFPQ index file")
 	flag.Parse()
 
 	cfgPath := filepath.Join(*resourcesDir, "normalization.json")
 	mccPath := filepath.Join(*resourcesDir, "mcc_risk.json")
-	refsPath := filepath.Join(*resourcesDir, "references.json.gz")
 
 	log.Printf("loading config from %s", cfgPath)
 	cfg, err := loadConfig(cfgPath)
@@ -29,27 +32,35 @@ func main() {
 		log.Fatalf("loadMCCRisk: %v", err)
 	}
 
-	log.Printf("loading dataset from %s (this takes ~10-30s)", refsPath)
+	log.Printf("loading index from %s", *indexPath)
 	t0 := time.Now()
-	ds, err := loadDataset(refsPath)
+	idx, err := ivfpq.LoadIndex(*indexPath)
 	if err != nil {
-		log.Fatalf("loadDataset: %v", err)
+		log.Fatalf("LoadIndex: %v", err)
 	}
-	log.Printf("dataset loaded: %d vectors in %s", len(ds.Vectors), time.Since(t0))
+	log.Printf("index loaded: N=%d, K=%d, M=%d, Kstar=%d in %s",
+		idx.N, idx.K, idx.M, idx.Kstar, time.Since(t0))
 
 	ready := &atomic.Bool{}
 	ready.Store(true)
 
 	app := &App{
-		Config:  cfg,
-		MCC:     mcc,
-		Dataset: ds,
-		Ready:   ready,
+		Config: cfg,
+		MCC:    mcc,
+		Index:  idx,
+		Ready:  ready,
 	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ready", app.handleReady)
 	mux.HandleFunc("/fraud-score", app.handleFraudScore)
+
+	go func() {
+		log.Printf("pprof listening on :6060")
+		if err := http.ListenAndServe("localhost:6060", nil); err != nil {
+			log.Printf("pprof server: %v", err)
+		}
+	}()
 
 	addr := ":9999"
 	log.Printf("listening on %s", addr)

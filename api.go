@@ -4,15 +4,17 @@ import (
 	"encoding/json"
 	"net/http"
 	"sync/atomic"
+
+	"github.com/lealre/rinha26-go/internal/ivfpq"
 )
 
 // App owns the immutable shared state of the API.
 // All fields except Ready are set once at startup and never mutated.
 type App struct {
-	Config  *Config
-	MCC     map[string]float64
-	Dataset *Dataset
-	Ready   *atomic.Bool
+	Config *Config
+	MCC    map[string]float64
+	Index  *ivfpq.IVFPQ
+	Ready  *atomic.Bool
 }
 
 type fraudResponse struct {
@@ -50,8 +52,8 @@ func (a *App) handleFraudScore(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	frauds := topKFraudCount(query, a.Dataset.Vectors, a.Dataset.Labels)
-	score := float32(frauds) / 5.0
+	frauds := a.Index.Search(query)
+	score := float32(frauds) / float32(ivfpq.IVFPQ_TopK)
 
 	resp := fraudResponse{
 		Approved:   score < 0.6,
