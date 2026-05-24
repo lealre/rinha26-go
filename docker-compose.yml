@@ -1,0 +1,76 @@
+# Submission branch: references the public image on Docker Hub instead of
+# building locally. Resource budget per the challenge: 1.0 CPU and 350 MB
+# across ALL services.
+#   lb   -> 0.10 CPU / 30 MB
+#   api1 -> 0.45 CPU / 160 MB
+#   api2 -> 0.45 CPU / 160 MB
+#   total = 1.00 CPU / 350 MB
+
+name: api
+
+services:
+  api1:
+    image: lealre/rinha26-go:ivf-sq
+    container_name: api1
+    environment:
+      GOMAXPROCS: "1"
+    volumes:
+      - ./resources:/resources:ro
+    deploy:
+      resources:
+        limits:
+          cpus: "0.45"
+          memory: "160MB"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:9999/ready"]
+      interval: 2s
+      timeout: 1s
+      retries: 60
+      start_period: 5s
+    networks:
+      - rinha
+
+  api2:
+    image: lealre/rinha26-go:ivf-sq
+    container_name: api2
+    environment:
+      GOMAXPROCS: "1"
+    volumes:
+      - ./resources:/resources:ro
+    deploy:
+      resources:
+        limits:
+          cpus: "0.45"
+          memory: "160MB"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:9999/ready"]
+      interval: 2s
+      timeout: 1s
+      retries: 60
+      start_period: 5s
+    networks:
+      - rinha
+
+  lb:
+    image: nginx:1.27-alpine
+    container_name: lb
+    depends_on:
+      api1:
+        condition: service_healthy
+      api2:
+        condition: service_healthy
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - "9999:9999"
+    deploy:
+      resources:
+        limits:
+          cpus: "0.10"
+          memory: "30MB"
+    networks:
+      - rinha
+
+networks:
+  rinha:
+    driver: bridge
