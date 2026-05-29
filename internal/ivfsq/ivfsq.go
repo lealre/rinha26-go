@@ -1,3 +1,20 @@
+// Package ivfsq is an IVF + int16-scalar-quantized vector index with an
+// AVX2 distance kernel.
+//
+// Storage layout v02: each cluster's vectors are organized into "blocks" of
+// 8 vectors, stored dim-major within each block:
+//
+//	block[d*8 + s]  = dim d of the s-th vector in the block
+//
+// One block is 14 × 8 = 112 int16 = 224 bytes — exactly the input format
+// expected by ScanBlock8AVX2 in scan_amd64.s. The last block of each cluster
+// is padded with sentinel int16 values so partial blocks always have 8 slots
+// to read; padded slots produce huge distances and never enter top-5.
+//
+// At query time, the leaf distance loop walks the blocks of each probed
+// cluster and calls ScanBlock8AVX2(q, block, worst, sum). The kernel handles
+// the per-block early-exit gate internally (it bails after dim 8 if all 8
+// vectors are already past the threshold).
 package ivfsq
 
 import (
@@ -10,34 +27,36 @@ import (
 	"unsafe"
 )
 
-// IVFSQ parameter constants. Bump the magic version on any layout change.
+// IVFSQ tunables. Bump the magic version on any layout change.
 const (
-	IVFSQ_K      = 1024 // number of IVF clusters
-	IVFSQ_Dim    = 14   // vector dimensionality
-	IVFSQ_TopK   = 5    // number of nearest neighbors to retrieve
-	IVFSQ_NProbe = 8    // clusters probed per query (was 16; halved to cut p99 since detection rate component is already saturated at nprobe=16)
-	IVFSQ_Scale  = 32767
+	IVFSQ_K       = 1024 // number of IVF clusters
+	IVFSQ_Dim     = 14   // vector dimensionality
+	IVFSQ_TopK    = 5    // number of nearest neighbors to retrieve
+	IVFSQ_NProbe  = 8    // clusters probed per query
+	IVFSQ_Scale   = 32767
+	BlockVecCount = 8                                  // vectors per block
+	BlockInts     = IVFSQ_Dim * BlockVecCount          // int16 per block (= 112)
+	BlockBytes    = BlockInts * 2                      // bytes per block (= 224)
+	SentinelI16   = 32767                              // padding value: produces huge distance, never wins top-5
 )
 
 // IVFSQ_Magic is the 8-byte file-format identifier written to /index.bin.
-var IVFSQ_Magic = [8]byte{'I', 'V', 'F', 'S', 'Q', 'v', '0', '1'}
+// v02 introduced the dim-major-block-of-8 leaf layout for the AVX2 kernel.
+var IVFSQ_Magic = [8]byte{'I', 'V', 'F', 'S', 'Q', 'v', '0', '2'}
 
-// IVFSQ is the in-memory IVF + int16-scalar-quantized index.
-//
-// Quantized and Labels alias the underlying byte buffer returned by
-// os.ReadFile; the buffer stays alive as long as any of these slices is
-// reachable.
+// IVFSQ is the in-memory index. All slices alias the file buffer returned by
+// os.ReadFile (zero-copy on amd64).
 type IVFSQ struct {
-	K uint32 // = IVFSQ_K
-	N uint32 // total number of indexed vectors
-
-	IVFCentroids   []float32 // K * IVFSQ_Dim
-	ClusterOffsets []uint32  // K+1
-	Quantized      []int16   // N * IVFSQ_Dim, grouped by cluster
-	Labels         []uint8   // N (0 = legit, 1 = fraud)
+	K           uint32 // = IVFSQ_K
+	N           uint32 // total number of real vectors (excludes padding)
+	TotalBlocks uint32 // total number of blocks across all clusters
+	IVFCentroids []float32 // K * Dim float32
+	BlockOffsets []uint32  // K+1 — cumulative block counts, NOT int16 offsets
+	BlockData    []int16   // TotalBlocks * BlockInts (dim-major within block)
+	BlockLabels  []uint8   // TotalBlocks * BlockVecCount (1 = fraud, 0 = legit / padding)
 }
 
-// quantize maps a single normalized float32 value to int16 in [-32767, 32767].
+// quantize maps a normalized float32 to int16 in [-32767, 32767].
 func quantize(v float32) int16 {
 	x := math.Round(float64(v) * float64(IVFSQ_Scale))
 	if x > float64(IVFSQ_Scale) {
@@ -48,7 +67,7 @@ func quantize(v float32) int16 {
 	return int16(x)
 }
 
-// Save serializes the index to path using the binary layout in the spec.
+// Save writes the index to path in the v02 binary layout.
 func (ivf *IVFSQ) Save(path string) error {
 	f, err := os.Create(path)
 	if err != nil {
@@ -60,21 +79,21 @@ func (ivf *IVFSQ) Save(path string) error {
 	if _, err := w.Write(IVFSQ_Magic[:]); err != nil {
 		return fmt.Errorf("write magic: %w", err)
 	}
-	hdr := []uint32{ivf.K, ivf.N}
+	hdr := []uint32{ivf.K, ivf.N, ivf.TotalBlocks}
 	if err := binary.Write(w, binary.LittleEndian, hdr); err != nil {
 		return fmt.Errorf("write header: %w", err)
 	}
 	if err := binary.Write(w, binary.LittleEndian, ivf.IVFCentroids); err != nil {
 		return fmt.Errorf("write IVFCentroids: %w", err)
 	}
-	if err := binary.Write(w, binary.LittleEndian, ivf.ClusterOffsets); err != nil {
-		return fmt.Errorf("write ClusterOffsets: %w", err)
+	if err := binary.Write(w, binary.LittleEndian, ivf.BlockOffsets); err != nil {
+		return fmt.Errorf("write BlockOffsets: %w", err)
 	}
-	if err := binary.Write(w, binary.LittleEndian, ivf.Quantized); err != nil {
-		return fmt.Errorf("write Quantized: %w", err)
+	if err := binary.Write(w, binary.LittleEndian, ivf.BlockData); err != nil {
+		return fmt.Errorf("write BlockData: %w", err)
 	}
-	if _, err := w.Write(ivf.Labels); err != nil {
-		return fmt.Errorf("write Labels: %w", err)
+	if _, err := w.Write(ivf.BlockLabels); err != nil {
+		return fmt.Errorf("write BlockLabels: %w", err)
 	}
 	if err := w.Flush(); err != nil {
 		return fmt.Errorf("flush: %w", err)
@@ -82,14 +101,15 @@ func (ivf *IVFSQ) Save(path string) error {
 	return nil
 }
 
-// LoadIndex reads an IVFSQ index from path. Slices alias the file buffer.
-// Assumes little-endian host (amd64). The challenge spec mandates amd64.
+// LoadIndex reads a v02 index from path. Slices alias the file buffer; the
+// underlying byte slice must stay reachable for the lifetime of the index.
+// Assumes little-endian (amd64).
 func LoadIndex(path string) (*IVFSQ, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("read %s: %w", path, err)
 	}
-	const headerSize = 16
+	const headerSize = 8 + 4*3 // magic + K + N + TotalBlocks
 	if len(data) < headerSize {
 		return nil, fmt.Errorf("file %s too small: %d bytes", path, len(data))
 	}
@@ -102,8 +122,9 @@ func LoadIndex(path string) (*IVFSQ, error) {
 	}
 
 	ivf := &IVFSQ{
-		K: binary.LittleEndian.Uint32(data[8:12]),
-		N: binary.LittleEndian.Uint32(data[12:16]),
+		K:           binary.LittleEndian.Uint32(data[8:12]),
+		N:           binary.LittleEndian.Uint32(data[12:16]),
+		TotalBlocks: binary.LittleEndian.Uint32(data[16:20]),
 	}
 	if ivf.K != IVFSQ_K {
 		return nil, fmt.Errorf("unsupported K in %s: %d (want %d)", path, ivf.K, IVFSQ_K)
@@ -120,23 +141,23 @@ func LoadIndex(path string) (*IVFSQ, error) {
 
 	offsetsBytes := (int(ivf.K) + 1) * 4
 	if offset+offsetsBytes > len(data) {
-		return nil, fmt.Errorf("file truncated at ClusterOffsets")
+		return nil, fmt.Errorf("file truncated at BlockOffsets")
 	}
-	ivf.ClusterOffsets = bytesToUint32(data[offset : offset+offsetsBytes])
+	ivf.BlockOffsets = bytesToUint32(data[offset : offset+offsetsBytes])
 	offset += offsetsBytes
 
-	quantizedBytes := int(ivf.N) * IVFSQ_Dim * 2
-	if offset+quantizedBytes > len(data) {
-		return nil, fmt.Errorf("file truncated at Quantized")
+	blockBytes := int(ivf.TotalBlocks) * BlockBytes
+	if offset+blockBytes > len(data) {
+		return nil, fmt.Errorf("file truncated at BlockData")
 	}
-	ivf.Quantized = bytesToInt16(data[offset : offset+quantizedBytes])
-	offset += quantizedBytes
+	ivf.BlockData = bytesToInt16(data[offset : offset+blockBytes])
+	offset += blockBytes
 
-	labelsBytes := int(ivf.N)
+	labelsBytes := int(ivf.TotalBlocks) * BlockVecCount
 	if offset+labelsBytes > len(data) {
-		return nil, fmt.Errorf("file truncated at Labels")
+		return nil, fmt.Errorf("file truncated at BlockLabels")
 	}
-	ivf.Labels = data[offset : offset+labelsBytes]
+	ivf.BlockLabels = data[offset : offset+labelsBytes]
 	offset += labelsBytes
 
 	if offset != len(data) {
@@ -146,6 +167,10 @@ func LoadIndex(path string) (*IVFSQ, error) {
 }
 
 // Build trains the IVFSQ index. Called only by cmd/build-index (offline).
+//
+// vectors: flat slice of N*Dim float32 (row-major per vector).
+// labels: N uint8 (1 = fraud, 0 = legit).
+// seed: deterministic across rebuilds when fixed.
 func Build(vectors []float32, labels []uint8, seed int64) *IVFSQ {
 	n := len(labels)
 	if len(vectors) != n*IVFSQ_Dim {
@@ -158,52 +183,89 @@ func Build(vectors []float32, labels []uint8, seed int64) *IVFSQ {
 	ivfRes := KMeans(vectors, n, IVFSQ_Dim, IVFSQ_K, 30, seed)
 	log.Printf("Build: IVF centroids done")
 
-	// Count cluster sizes.
+	// Count vectors per cluster, then compute block counts.
 	counts := make([]uint32, IVFSQ_K)
 	for _, c := range ivfRes.Assignments {
 		counts[c]++
 	}
-	offsets := make([]uint32, IVFSQ_K+1)
+	blockCounts := make([]uint32, IVFSQ_K)
+	totalBlocks := uint32(0)
 	for c := 0; c < IVFSQ_K; c++ {
-		offsets[c+1] = offsets[c] + counts[c]
+		blockCounts[c] = (counts[c] + BlockVecCount - 1) / BlockVecCount
+		totalBlocks += blockCounts[c]
 	}
-	if offsets[IVFSQ_K] != uint32(n) {
-		log.Fatalf("Build: offset sum mismatch: got %d, want %d", offsets[IVFSQ_K], n)
+	blockOffsets := make([]uint32, IVFSQ_K+1)
+	for c := 0; c < IVFSQ_K; c++ {
+		blockOffsets[c+1] = blockOffsets[c] + blockCounts[c]
 	}
 
-	// Fill Quantized and Labels in cluster-grouped order.
-	quantized := make([]int16, n*IVFSQ_Dim)
-	labs := make([]uint8, n)
-	cursor := make([]uint32, IVFSQ_K)
-	copy(cursor, offsets[:IVFSQ_K])
-
-	log.Printf("Build: quantizing %d vectors to int16...", n)
+	// Reverse map: each cluster c stores []vectorIdx of length counts[c].
+	// vectorOrder[c] = []int of source indices in cluster c, in their
+	// original encounter order.
+	clusterMembers := make([][]int, IVFSQ_K)
+	for c := 0; c < IVFSQ_K; c++ {
+		clusterMembers[c] = make([]int, 0, counts[c])
+	}
 	for i := 0; i < n; i++ {
 		c := ivfRes.Assignments[i]
-		pos := cursor[c]
-		cursor[c]++
-		for j := 0; j < IVFSQ_Dim; j++ {
-			quantized[int(pos)*IVFSQ_Dim+j] = quantize(vectors[i*IVFSQ_Dim+j])
-		}
-		labs[pos] = labels[i]
+		clusterMembers[c] = append(clusterMembers[c], i)
 	}
-	log.Printf("Build: done")
+
+	blockData := make([]int16, int(totalBlocks)*BlockInts)
+	blockLabels := make([]uint8, int(totalBlocks)*BlockVecCount)
+
+	// Pre-fill all slots with sentinel so partial-final-block padding works.
+	for i := range blockData {
+		blockData[i] = SentinelI16
+	}
+
+	log.Printf("Build: laying out %d blocks (dim-major-of-8)...", totalBlocks)
+	for c := 0; c < IVFSQ_K; c++ {
+		members := clusterMembers[c]
+		clusterBlockStart := blockOffsets[c]
+		for b := uint32(0); b < blockCounts[c]; b++ {
+			globalBlock := int(clusterBlockStart + b)
+			blockDataOff := globalBlock * BlockInts
+			blockLabelOff := globalBlock * BlockVecCount
+			for s := 0; s < BlockVecCount; s++ {
+				localIdx := int(b)*BlockVecCount + s
+				if localIdx >= len(members) {
+					// Padding slot: keep SentinelI16 across all dims; label 0.
+					continue
+				}
+				vIdx := members[localIdx]
+				for d := 0; d < IVFSQ_Dim; d++ {
+					blockData[blockDataOff+d*BlockVecCount+s] = quantize(vectors[vIdx*IVFSQ_Dim+d])
+				}
+				blockLabels[blockLabelOff+s] = labels[vIdx]
+			}
+		}
+	}
+	log.Printf("Build: done; total_blocks=%d, mean_vecs_per_block=%.2f",
+		totalBlocks, float64(n)/float64(totalBlocks))
 
 	return &IVFSQ{
-		K:              IVFSQ_K,
-		N:              uint32(n),
-		IVFCentroids:   ivfRes.Centroids,
-		ClusterOffsets: offsets,
-		Quantized:      quantized,
-		Labels:         labs,
+		K:            IVFSQ_K,
+		N:            uint32(n),
+		TotalBlocks:  totalBlocks,
+		IVFCentroids: ivfRes.Centroids,
+		BlockOffsets: blockOffsets,
+		BlockData:    blockData,
+		BlockLabels:  blockLabels,
 	}
 }
 
 // Search returns the count of fraud labels among the IVFSQ_TopK nearest
-// reference vectors. Per-query work: K float32 centroid distances, query
-// quantization, then a scan of NProbe clusters using int distance.
+// reference vectors to the query.
+//
+// Path:
+//  1. Scalar scan of K=1024 centroids → top NProbe clusters.
+//  2. For each probed cluster, walk its blocks and call ScanBlock8AVX2 to
+//     get 8 squared distances per call. Insert any below-threshold winners
+//     into the top-5 buffer.
+//  3. Tally fraud labels among the final top-5.
 func (ivf *IVFSQ) Search(query [IVFSQ_Dim]float32) int {
-	// 1. Find the NProbe nearest IVF centroids (float32 distance).
+	// 1. Find the NProbe nearest IVF centroids (float32 distance, scalar).
 	type centDist struct {
 		idx  uint32
 		dist float32
@@ -230,114 +292,52 @@ func (ivf *IVFSQ) Search(query [IVFSQ_Dim]float32) int {
 		topProbes[k] = centDist{idx: c, dist: d}
 	}
 
-	// 2. Quantize the query once.
-	var qInt [IVFSQ_Dim]int32
-	for j := 0; j < IVFSQ_Dim; j++ {
-		qInt[j] = int32(quantize(query[j]))
-	}
-
-	// 3. Scan candidate clusters with int64 distance accumulator.
+	// 2. Walk blocks per probed cluster with the AVX2 kernel.
 	type cand struct {
-		dist  int64
+		dist  float32
 		fraud bool
 	}
 	var top [IVFSQ_TopK]cand
 	for i := range top {
-		top[i].dist = math.MaxInt64
+		top[i].dist = math.MaxFloat32
+	}
+	threshold := top[IVFSQ_TopK-1].dist
+
+	// The kernel expects an int16 query in scaled units to match the
+	// quantized refs. We pass float32 query in *scaled* units (multiplied by
+	// IVFSQ_Scale) so the kernel's VCVTDQ2PS(ref) and broadcast(query) live
+	// in the same coordinate system.
+	var qScaled [IVFSQ_Dim]float32
+	for j := 0; j < IVFSQ_Dim; j++ {
+		qScaled[j] = query[j] * float32(IVFSQ_Scale)
 	}
 
-	// threshold caches the current 5th-best distance so the hot inner loop
-	// can bail out as soon as a partial squared sum exceeds it. Most
-	// candidates fall far from the query; per-dim early exit lets us skip
-	// the remaining dims (and the int64 multiplies) for those candidates.
-	threshold := top[IVFSQ_TopK-1].dist
+	var sum [8]float32
 
 	for _, probe := range topProbes {
 		c := probe.idx
-		start := ivf.ClusterOffsets[c]
-		end := ivf.ClusterOffsets[c+1]
-		for i := start; i < end; i++ {
-			base := int(i) * IVFSQ_Dim
-
-			d := qInt[0] - int32(ivf.Quantized[base+0])
-			sum := int64(d) * int64(d)
-			if sum >= threshold {
+		blockStart := ivf.BlockOffsets[c]
+		blockEnd := ivf.BlockOffsets[c+1]
+		for b := blockStart; b < blockEnd; b++ {
+			blockPtr := &ivf.BlockData[int(b)*BlockInts]
+			alive := ScanBlock8AVX2(&qScaled[0], blockPtr, threshold, &sum)
+			if !alive {
 				continue
 			}
-			d = qInt[1] - int32(ivf.Quantized[base+1])
-			sum += int64(d) * int64(d)
-			if sum >= threshold {
-				continue
+			labelOff := int(b) * BlockVecCount
+			for s := 0; s < BlockVecCount; s++ {
+				if sum[s] >= threshold {
+					continue
+				}
+				fraud := ivf.BlockLabels[labelOff+s] == 1
+				k := IVFSQ_TopK - 1
+				for k > 0 && top[k-1].dist > sum[s] {
+					top[k] = top[k-1]
+					k--
+				}
+				top[k] = cand{dist: sum[s], fraud: fraud}
+				threshold = top[IVFSQ_TopK-1].dist
 			}
-			d = qInt[2] - int32(ivf.Quantized[base+2])
-			sum += int64(d) * int64(d)
-			if sum >= threshold {
-				continue
-			}
-			d = qInt[3] - int32(ivf.Quantized[base+3])
-			sum += int64(d) * int64(d)
-			if sum >= threshold {
-				continue
-			}
-			d = qInt[4] - int32(ivf.Quantized[base+4])
-			sum += int64(d) * int64(d)
-			if sum >= threshold {
-				continue
-			}
-			d = qInt[5] - int32(ivf.Quantized[base+5])
-			sum += int64(d) * int64(d)
-			if sum >= threshold {
-				continue
-			}
-			d = qInt[6] - int32(ivf.Quantized[base+6])
-			sum += int64(d) * int64(d)
-			if sum >= threshold {
-				continue
-			}
-			d = qInt[7] - int32(ivf.Quantized[base+7])
-			sum += int64(d) * int64(d)
-			if sum >= threshold {
-				continue
-			}
-			d = qInt[8] - int32(ivf.Quantized[base+8])
-			sum += int64(d) * int64(d)
-			if sum >= threshold {
-				continue
-			}
-			d = qInt[9] - int32(ivf.Quantized[base+9])
-			sum += int64(d) * int64(d)
-			if sum >= threshold {
-				continue
-			}
-			d = qInt[10] - int32(ivf.Quantized[base+10])
-			sum += int64(d) * int64(d)
-			if sum >= threshold {
-				continue
-			}
-			d = qInt[11] - int32(ivf.Quantized[base+11])
-			sum += int64(d) * int64(d)
-			if sum >= threshold {
-				continue
-			}
-			d = qInt[12] - int32(ivf.Quantized[base+12])
-			sum += int64(d) * int64(d)
-			if sum >= threshold {
-				continue
-			}
-			d = qInt[13] - int32(ivf.Quantized[base+13])
-			sum += int64(d) * int64(d)
-			if sum >= threshold {
-				continue
-			}
-
-			fraud := ivf.Labels[i] == 1
-			k := IVFSQ_TopK - 1
-			for k > 0 && top[k-1].dist > sum {
-				top[k] = top[k-1]
-				k--
-			}
-			top[k] = cand{dist: sum, fraud: fraud}
-			threshold = top[IVFSQ_TopK-1].dist
 		}
 	}
 
