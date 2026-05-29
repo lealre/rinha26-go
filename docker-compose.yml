@@ -1,66 +1,91 @@
-# Submission branch: references the public image on Docker Hub instead of
-# building locally. Resource budget per the challenge: 1.0 CPU and 350 MB
-# across ALL services.
+# Submission branch: references the public image on Docker Hub. Resource
+# budget per the challenge: 1.0 CPU and 350 MB across ALL services.
 #   lb   -> 0.10 CPU / 30 MB
 #   api1 -> 0.45 CPU / 160 MB
 #   api2 -> 0.45 CPU / 160 MB
 #   total = 1.00 CPU / 350 MB
+#
+# Architecture: the lb container runs a custom Go binary (cmd/lb in the
+# source tree) that accepts client TCP on :9999, then hands the raw file
+# descriptor to one of the api workers via SCM_RIGHTS over a Unix control
+# socket in the shared `socket-dir` volume. Workers read/write the client
+# socket directly afterwards; the lb is out of the data path.
+#
+# All three services run from the same image — `entrypoint` selects which
+# binary (`/usr/local/bin/api` vs `/usr/local/bin/lb`). `pull_policy: always`
+# guarantees the test runner pulls the manifest fresh and never uses a
+# previously-cached local copy of this tag.
 
 name: api
 
 services:
   api1:
-    image: lealre/rinha26-go:ivf-sq
+    image: lealre/rinha26-go:ivf-sq-v2
+    pull_policy: always
     container_name: api1
     environment:
       GOMAXPROCS: "1"
+      GOGC: "off"
+      GOMEMLIMIT: "140MiB"
+    command: ["--listen-fd=/var/run/rinha/api1-ctrl.sock"]
     volumes:
       - ./resources:/resources:ro
+      - socket-dir:/var/run/rinha
     deploy:
       resources:
         limits:
           cpus: "0.45"
           memory: "160MB"
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:9999/ready"]
-      interval: 2s
+      test: ["CMD-SHELL", "test -S /var/run/rinha/api1-ctrl.sock"]
+      interval: 1s
       timeout: 1s
-      retries: 60
-      start_period: 5s
+      retries: 30
+      start_period: 2s
     networks:
       - rinha
 
   api2:
-    image: lealre/rinha26-go:ivf-sq
+    image: lealre/rinha26-go:ivf-sq-v2
+    pull_policy: always
     container_name: api2
     environment:
       GOMAXPROCS: "1"
+      GOGC: "off"
+      GOMEMLIMIT: "140MiB"
+    command: ["--listen-fd=/var/run/rinha/api2-ctrl.sock"]
     volumes:
       - ./resources:/resources:ro
+      - socket-dir:/var/run/rinha
     deploy:
       resources:
         limits:
           cpus: "0.45"
           memory: "160MB"
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:9999/ready"]
-      interval: 2s
+      test: ["CMD-SHELL", "test -S /var/run/rinha/api2-ctrl.sock"]
+      interval: 1s
       timeout: 1s
-      retries: 60
-      start_period: 5s
+      retries: 30
+      start_period: 2s
     networks:
       - rinha
 
   lb:
-    image: nginx:1.27-alpine
+    image: lealre/rinha26-go:ivf-sq-v2
+    pull_policy: always
     container_name: lb
+    entrypoint: ["/usr/local/bin/lb"]
+    command:
+      - "--listen=:9999"
+      - "--workers=/var/run/rinha/api1-ctrl.sock,/var/run/rinha/api2-ctrl.sock"
     depends_on:
       api1:
         condition: service_healthy
       api2:
         condition: service_healthy
     volumes:
-      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - socket-dir:/var/run/rinha
     ports:
       - "9999:9999"
     deploy:
@@ -70,6 +95,9 @@ services:
           memory: "30MB"
     networks:
       - rinha
+
+volumes:
+  socket-dir:
 
 networks:
   rinha:
