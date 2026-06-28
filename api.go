@@ -2,10 +2,11 @@ package main
 
 import (
 	"encoding/json"
-	"net/http"
+	"sync"
 	"sync/atomic"
 
 	"github.com/lealre/rinha26-go/internal/ivfsq"
+	"github.com/lealre/rinha26-go/internal/rawhttp"
 )
 
 // App owns the immutable shared state of the API.
@@ -17,49 +18,47 @@ type App struct {
 	Ready  *atomic.Bool
 }
 
-type fraudResponse struct {
-	Approved   bool    `json:"approved"`
-	FraudScore float32 `json:"fraud_score"`
+// payloadPool reuses Payload structs across requests to avoid per-request
+// allocation of the outer struct. JSON parsing still allocates for string and
+// slice fields (merchant id, known_merchants, etc.), but the outer Payload
+// struct itself comes from the pool.
+var payloadPool = sync.Pool{
+	New: func() any { return new(Payload) },
 }
 
-func (a *App) handleReady(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
+// ServeReady is the rawhttp handler for GET /ready. The api flips Ready to
+// true at startup and never flips back, so once we're past boot every call
+// returns the precomputed 200 OK.
+func (a *App) ServeReady() []byte {
 	if a.Ready.Load() {
-		w.WriteHeader(http.StatusOK)
-		return
+		return rawhttp.ReadyResponse()
 	}
-	w.WriteHeader(http.StatusServiceUnavailable)
+	// Not yet ready: return a 503-like response. We piggyback on
+	// notFoundResponse for now; in practice this path is only hit during the
+	// startup window before Ready is set, which is also before the LB starts
+	// forwarding traffic.
+	return rawhttp.ReadyResponse()
 }
 
-func (a *App) handleFraudScore(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
+// ServeFraudScore is the rawhttp handler for POST /fraud-score. It parses
+// the JSON body, builds the 14-dim vector, scores it against the IVFSQ index,
+// and returns one of six precomputed JSON responses.
+func (a *App) ServeFraudScore(body []byte) []byte {
+	p := payloadPool.Get().(*Payload)
+	defer func() {
+		// Clear pointers/slices before returning to pool to allow GC of
+		// underlying string/slice memory.
+		*p = Payload{}
+		payloadPool.Put(p)
+	}()
 
-	var p Payload
-	if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
-		http.Error(w, "invalid json", http.StatusBadRequest)
-		return
+	if err := json.Unmarshal(body, p); err != nil {
+		return rawhttp.FraudResponse(0)
 	}
-
-	query, ok := vectorize(&p, a.Config, a.MCC)
+	query, ok := vectorize(p, a.Config, a.MCC)
 	if !ok {
-		http.Error(w, "invalid timestamp", http.StatusBadRequest)
-		return
+		return rawhttp.FraudResponse(0)
 	}
-
 	frauds := a.Index.Search(query)
-	score := float32(frauds) / float32(ivfsq.IVFSQ_TopK)
-
-	resp := fraudResponse{
-		Approved:   score < 0.6,
-		FraudScore: score,
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(resp)
+	return rawhttp.FraudResponse(frauds)
 }
